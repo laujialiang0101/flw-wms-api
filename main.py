@@ -20,8 +20,16 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import asyncpg
 
-# Database connection
-DATABASE_URL = os.getenv('DATABASE_URL', '')
+# Database configuration (same as KPI Tracker)
+DB_CONFIG = {
+    'host': os.getenv('DB_HOST', 'dpg-d4pr99je5dus73eb5730-a.singapore-postgres.render.com'),
+    'port': int(os.getenv('DB_PORT', 5432)),
+    'database': os.getenv('DB_NAME', 'flt_sales_commission_db'),
+    'user': os.getenv('DB_USER', 'flt_sales_commission_db_user'),
+    'password': os.getenv('DB_PASSWORD', ''),
+    'ssl': 'require'
+}
+
 pool: asyncpg.Pool = None
 
 
@@ -29,14 +37,8 @@ pool: asyncpg.Pool = None
 async def lifespan(app: FastAPI):
     """Manage database connection pool lifecycle."""
     global pool
-    if DATABASE_URL:
-        pool = await asyncpg.create_pool(
-            DATABASE_URL,
-            min_size=2,
-            max_size=10,
-            ssl='require'
-        )
-        print("Database pool created")
+    pool = await asyncpg.create_pool(**DB_CONFIG, min_size=2, max_size=10)
+    print("Database pool created")
     yield
     if pool:
         await pool.close()
