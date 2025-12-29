@@ -263,10 +263,11 @@ async def get_stock_balance_summary(
                         b."AcLocationID" as location_id,
                         l."AcLocationDesc" as location_name,
                         COUNT(DISTINCT b."AcStockID") as sku_count,
-                        SUM(COALESCE(b."BalanceQty", 0)) as total_qty,
-                        SUM(COALESCE(b."BalanceQty", 0) * COALESCE(b."ItemCost", 0)) as total_value
+                        SUM(COALESCE(b."BalanceQuantity", 0)) as total_qty,
+                        SUM(COALESCE(b."BalanceQuantity", 0) * COALESCE(s."ItemCost", 0)) as total_value
                     FROM "AcStockBalanceLocation" b
                     LEFT JOIN "AcLocation" l ON b."AcLocationID" = l."AcLocationID"
+                    LEFT JOIN "AcStockCompany" s ON b."AcStockID" = s."AcStockID" AND b."AcStockUOMID" = s."AcStockUOMID"
                     WHERE b."AcLocationID" = $1
                     GROUP BY b."AcLocationID", l."AcLocationDesc"
                 """, location_id)
@@ -276,10 +277,11 @@ async def get_stock_balance_summary(
                         b."AcLocationID" as location_id,
                         l."AcLocationDesc" as location_name,
                         COUNT(DISTINCT b."AcStockID") as sku_count,
-                        SUM(COALESCE(b."BalanceQty", 0)) as total_qty,
-                        SUM(COALESCE(b."BalanceQty", 0) * COALESCE(b."ItemCost", 0)) as total_value
+                        SUM(COALESCE(b."BalanceQuantity", 0)) as total_qty,
+                        SUM(COALESCE(b."BalanceQuantity", 0) * COALESCE(s."ItemCost", 0)) as total_value
                     FROM "AcStockBalanceLocation" b
                     LEFT JOIN "AcLocation" l ON b."AcLocationID" = l."AcLocationID"
+                    LEFT JOIN "AcStockCompany" s ON b."AcStockID" = s."AcStockID" AND b."AcStockUOMID" = s."AcStockUOMID"
                     GROUP BY b."AcLocationID", l."AcLocationDesc"
                     ORDER BY total_value DESC
                 """)
@@ -317,7 +319,7 @@ async def get_movement_analysis(
                 current_balance AS (
                     SELECT
                         "AcStockID" as stock_id,
-                        SUM(COALESCE("BalanceQty", 0)) as balance_qty
+                        SUM(COALESCE("BalanceQuantity", 0)) as balance_qty
                     FROM "AcStockBalanceLocation"
                     WHERE "AcLocationID" = $1
                     GROUP BY "AcStockID"
@@ -379,10 +381,11 @@ async def get_stock_days_analysis(
                 ),
                 current_stock AS (
                     SELECT
-                        "AcLocationID" as location_id,
-                        SUM(COALESCE("BalanceQty", 0) * COALESCE("ItemCost", 0)) as stock_value
-                    FROM "AcStockBalanceLocation"
-                    GROUP BY "AcLocationID"
+                        b."AcLocationID" as location_id,
+                        SUM(COALESCE(b."BalanceQuantity", 0) * COALESCE(s."ItemCost", 0)) as stock_value
+                    FROM "AcStockBalanceLocation" b
+                    LEFT JOIN "AcStockCompany" s ON b."AcStockID" = s."AcStockID" AND b."AcStockUOMID" = s."AcStockUOMID"
+                    GROUP BY b."AcLocationID"
                 )
                 SELECT
                     cs.location_id,
@@ -410,8 +413,9 @@ async def get_stock_days_analysis(
                     WHERE m."DocumentDate"::date >= $1
                 ),
                 total_stock AS (
-                    SELECT SUM(COALESCE("BalanceQty", 0) * COALESCE("ItemCost", 0)) as stock_value
-                    FROM "AcStockBalanceLocation"
+                    SELECT SUM(COALESCE(b."BalanceQuantity", 0) * COALESCE(s."ItemCost", 0)) as stock_value
+                    FROM "AcStockBalanceLocation" b
+                    LEFT JOIN "AcStockCompany" s ON b."AcStockID" = s."AcStockID" AND b."AcStockUOMID" = s."AcStockUOMID"
                 )
                 SELECT
                     ts.stock_value,
