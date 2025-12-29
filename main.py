@@ -163,6 +163,26 @@ async def get_table_schema(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/v1/admin/query")
+async def run_query(
+    sql: str = Query(..., description="SQL query to run"),
+    api_key: str = Query(...)
+):
+    """Run a read-only SQL query for data exploration."""
+    verify_api_key(api_key)
+
+    # Only allow SELECT queries
+    if not sql.strip().upper().startswith("SELECT"):
+        raise HTTPException(status_code=400, detail="Only SELECT queries allowed")
+
+    try:
+        async with pool.acquire() as conn:
+            result = await conn.fetch(sql)
+            return {"rows": [dict(r) for r in result], "count": len(result)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/v1/admin/inventory-tables")
 async def get_inventory_tables(api_key: str = Query(...)):
     """Get overview of inventory-related tables."""
