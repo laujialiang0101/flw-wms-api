@@ -3498,25 +3498,16 @@ async def analyze_monthly_movement(api_key: str = Query(...)):
             """)
 
             # Step 7: Calculate trend 7d vs AMS (better than 7d vs 30d)
-            # AMS daily rate = ams_3m / 30, 7d daily rate = avg_daily_7d
-            # Trend % = ((7d rate - AMS rate) / AMS rate) × 100
+            # Uses last_7d_qty / 7 as daily rate, compared to AMS daily rate (ams_3m / 30)
+            # Note: This is also updated every 60 seconds by the sync service hook
             await conn.execute("""
                 UPDATE wms.stock_movement_summary
                 SET
                     trend_7d_vs_ams = CASE
-                        WHEN ams_3m > 0 THEN ROUND(
-                            ((avg_daily_7d - (ams_3m / 30.0)) / (ams_3m / 30.0)) * 100, 1
+                        WHEN ams_3m > 0 AND last_7d_qty IS NOT NULL THEN ROUND(
+                            (((COALESCE(last_7d_qty, 0) / 7.0) - (ams_3m / 30.0)) / (ams_3m / 30.0)) * 100, 1
                         )
                         ELSE NULL
-                    END,
-                    trend_status = CASE
-                        WHEN ams_3m = 0 OR ams_3m IS NULL THEN 'NO_BASELINE'
-                        WHEN avg_daily_7d = 0 THEN 'NO_SALES'
-                        WHEN avg_daily_7d > (ams_3m / 30.0) * 1.5 THEN 'SPIKE'
-                        WHEN avg_daily_7d > (ams_3m / 30.0) * 1.3 THEN 'RISING'
-                        WHEN avg_daily_7d < (ams_3m / 30.0) * 0.5 THEN 'DROPPING'
-                        WHEN avg_daily_7d < (ams_3m / 30.0) * 0.7 THEN 'DECLINING'
-                        ELSE 'STABLE'
                     END
             """)
 
@@ -3560,11 +3551,11 @@ async def analyze_monthly_movement(api_key: str = Query(...)):
                     COUNT(*) FILTER (WHERE reorder_recommendation = 'ORDER_SOON') as order_soon,
                     COUNT(*) FILTER (WHERE reorder_recommendation = 'STOP_ORDERING') as stop_ordering,
                     COUNT(*) FILTER (WHERE reorder_recommendation = 'DELIST_CANDIDATE') as delist_candidates,
-                    COUNT(*) FILTER (WHERE trend_status = 'SPIKE') as trend_spike,
-                    COUNT(*) FILTER (WHERE trend_status = 'RISING') as trend_rising,
-                    COUNT(*) FILTER (WHERE trend_status = 'STABLE') as trend_stable,
-                    COUNT(*) FILTER (WHERE trend_status = 'DECLINING') as trend_declining,
-                    COUNT(*) FILTER (WHERE trend_status = 'DROPPING') as trend_dropping
+                    COUNT(*) FILTER (WHERE trend_7d_vs_ams > 50) as trend_spike,
+                    COUNT(*) FILTER (WHERE trend_7d_vs_ams > 30 AND trend_7d_vs_ams <= 50) as trend_rising,
+                    COUNT(*) FILTER (WHERE trend_7d_vs_ams >= -30 AND trend_7d_vs_ams <= 30) as trend_stable,
+                    COUNT(*) FILTER (WHERE trend_7d_vs_ams < -30 AND trend_7d_vs_ams >= -50) as trend_declining,
+                    COUNT(*) FILTER (WHERE trend_7d_vs_ams < -50) as trend_dropping
                 FROM wms.stock_movement_summary
             """)
 
