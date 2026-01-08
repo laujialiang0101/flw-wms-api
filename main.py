@@ -3512,15 +3512,13 @@ async def analyze_monthly_movement(api_key: str = Query(...)):
                 END
             """)
 
-            # Step 9: Get UOM descriptions
+            # Step 9: Get UOM descriptions (base UOM only - simpler and faster)
             await conn.execute("""
                 UPDATE wms.stock_movement_summary sms
                 SET
-                    base_uom_desc = u_base."AcStockUOMDesc",
-                    order_uom_desc = COALESCE(u_order."AcStockUOMDesc", u_base."AcStockUOMDesc")
-                FROM "AcStockUOM" u_base
-                LEFT JOIN "AcStockUOM" u_order ON sms.order_uom = u_order."AcStockUOMID"
-                WHERE sms.base_uom = u_base."AcStockUOMID"
+                    base_uom_desc = u."AcStockUOMDesc"
+                FROM "AcStockUOM" u
+                WHERE sms.base_uom = u."AcStockUOMID"
             """)
 
             # Get summary stats
