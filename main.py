@@ -2957,6 +2957,55 @@ async def setup_stock_movement_table(api_key: str = Query(...)):
                     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='balance_in_order_uom') THEN
                         ALTER TABLE wms.stock_movement_summary ADD COLUMN balance_in_order_uom NUMERIC;
                     END IF;
+                    -- Monthly movement columns (last 12 months)
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='qty_m1') THEN
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN qty_m1 NUMERIC DEFAULT 0;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN qty_m2 NUMERIC DEFAULT 0;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN qty_m3 NUMERIC DEFAULT 0;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN qty_m4 NUMERIC DEFAULT 0;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN qty_m5 NUMERIC DEFAULT 0;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN qty_m6 NUMERIC DEFAULT 0;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN qty_m7 NUMERIC DEFAULT 0;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN qty_m8 NUMERIC DEFAULT 0;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN qty_m9 NUMERIC DEFAULT 0;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN qty_m10 NUMERIC DEFAULT 0;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN qty_m11 NUMERIC DEFAULT 0;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN qty_m12 NUMERIC DEFAULT 0;
+                    END IF;
+                    -- 3-Month Average Monthly Sellout (AMS)
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='ams_3m') THEN
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN ams_3m NUMERIC DEFAULT 0;
+                    END IF;
+                    -- Seasonality classification
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='seasonality_type') THEN
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN seasonality_type VARCHAR(30) DEFAULT 'UNKNOWN';
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN seasonal_peak_trough_ratio NUMERIC;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN peak_months VARCHAR(20);
+                    END IF;
+                    -- Velocity category
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='velocity_category') THEN
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN velocity_category VARCHAR(10) DEFAULT 'UNKNOWN';
+                    END IF;
+                    -- Lead time category (LONG for HB, STANDARD for others)
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='lead_time_category') THEN
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN lead_time_category VARCHAR(10) DEFAULT 'STANDARD';
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN lead_time_days INTEGER DEFAULT 14;
+                    END IF;
+                    -- Smart reorder recommendation
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='reorder_recommendation') THEN
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN reorder_recommendation VARCHAR(20) DEFAULT 'UNKNOWN';
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN target_doi INTEGER;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN reorder_point NUMERIC;
+                    END IF;
+                    -- Base UOM description
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='base_uom_desc') THEN
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN base_uom_desc VARCHAR(50);
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN order_uom_desc VARCHAR(50);
+                    END IF;
+                    -- Trend 7d vs AMS (better baseline than 30d)
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='trend_7d_vs_ams') THEN
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN trend_7d_vs_ams NUMERIC;
+                    END IF;
                 END $$;
             """)
 
@@ -3259,10 +3308,15 @@ async def view_stock_movement(
                 SELECT stock_id, stock_name, barcode, ud1_code, abc_xyz_class,
                        qty_last_7d, qty_last_30d, avg_daily_30d, trend_status, trend_7d_vs_30d,
                        health_score, gp_margin_pct,
-                       base_uom, order_uom, order_uom_rate, balance_in_order_uom,
+                       base_uom, base_uom_desc, order_uom, order_uom_desc, order_uom_rate, balance_in_order_uom,
                        current_balance, days_of_inventory, stockout_risk,
-                       suggested_reorder_qty,
-                       revenue_last_30d, therapeutic_group
+                       suggested_reorder_qty, reorder_point, target_doi,
+                       revenue_last_30d, therapeutic_group,
+                       ams_3m, velocity_category, lead_time_category, lead_time_days,
+                       seasonality_type, seasonal_peak_trough_ratio, peak_months,
+                       reorder_recommendation,
+                       qty_m1, qty_m2, qty_m3, qty_m4, qty_m5, qty_m6,
+                       qty_m7, qty_m8, qty_m9, qty_m10, qty_m11, qty_m12
                 FROM wms.stock_movement_summary
                 WHERE {where_clause}
                 ORDER BY revenue_last_30d DESC NULLS LAST
@@ -3276,6 +3330,273 @@ async def view_stock_movement(
                 "filters": {"trend_status": trend_status, "stockout_risk": stockout_risk, "abc_class": abc_class, "ud1_code": ud1_code},
                 "count": len(rows),
                 "data": [dict(r) for r in rows]
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/stock-movement/analyze-monthly")
+async def analyze_monthly_movement(api_key: str = Query(...)):
+    """Analyze monthly movement patterns, calculate seasonality, and update recommendations.
+
+    This endpoint:
+    1. Calculates monthly sales for each SKU (last 12 months)
+    2. Calculates 3-month AMS (Average Monthly Sellout)
+    3. Identifies seasonality based on peak/trough ratio
+    4. Sets velocity category (FAST/MEDIUM/SLOW/DEAD)
+    5. Sets lead time category (LONG for HB, STANDARD for others)
+    6. Calculates smart reorder recommendations
+    """
+    verify_api_key(api_key)
+
+    try:
+        start_time = datetime.now()
+
+        async with pool.acquire() as conn:
+            # Step 1: Calculate monthly sales for last 12 months
+            # M1 = current month, M12 = 12 months ago
+            await conn.execute("""
+                WITH monthly_sales AS (
+                    SELECT
+                        d."AcStockID" as stock_id,
+                        DATE_TRUNC('month', m."DocumentDate") as sale_month,
+                        SUM(d."ItemQuantity") as qty
+                    FROM "AcCSD" d
+                    INNER JOIN "AcCSM" m ON d."DocumentNo" = m."DocumentNo"
+                    WHERE m."DocumentDate" >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '12 months'
+                    GROUP BY d."AcStockID", DATE_TRUNC('month', m."DocumentDate")
+
+                    UNION ALL
+
+                    SELECT
+                        d."AcStockID" as stock_id,
+                        DATE_TRUNC('month', m."DocumentDate") as sale_month,
+                        SUM(d."ItemQuantity") as qty
+                    FROM "AcCusInvoiceD" d
+                    INNER JOIN "AcCusInvoiceM" m ON d."DocumentNo" = m."DocumentNo"
+                    WHERE m."DocumentDate" >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '12 months'
+                    GROUP BY d."AcStockID", DATE_TRUNC('month', m."DocumentDate")
+                ),
+                monthly_totals AS (
+                    SELECT stock_id, sale_month, SUM(qty) as qty
+                    FROM monthly_sales
+                    GROUP BY stock_id, sale_month
+                ),
+                pivoted AS (
+                    SELECT
+                        stock_id,
+                        MAX(CASE WHEN sale_month = DATE_TRUNC('month', CURRENT_DATE) THEN qty ELSE 0 END) as m1,
+                        MAX(CASE WHEN sale_month = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month' THEN qty ELSE 0 END) as m2,
+                        MAX(CASE WHEN sale_month = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '2 months' THEN qty ELSE 0 END) as m3,
+                        MAX(CASE WHEN sale_month = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '3 months' THEN qty ELSE 0 END) as m4,
+                        MAX(CASE WHEN sale_month = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '4 months' THEN qty ELSE 0 END) as m5,
+                        MAX(CASE WHEN sale_month = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '5 months' THEN qty ELSE 0 END) as m6,
+                        MAX(CASE WHEN sale_month = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '6 months' THEN qty ELSE 0 END) as m7,
+                        MAX(CASE WHEN sale_month = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '7 months' THEN qty ELSE 0 END) as m8,
+                        MAX(CASE WHEN sale_month = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '8 months' THEN qty ELSE 0 END) as m9,
+                        MAX(CASE WHEN sale_month = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '9 months' THEN qty ELSE 0 END) as m10,
+                        MAX(CASE WHEN sale_month = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '10 months' THEN qty ELSE 0 END) as m11,
+                        MAX(CASE WHEN sale_month = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '11 months' THEN qty ELSE 0 END) as m12
+                    FROM monthly_totals
+                    GROUP BY stock_id
+                )
+                UPDATE wms.stock_movement_summary sms
+                SET
+                    qty_m1 = COALESCE(p.m1, 0),
+                    qty_m2 = COALESCE(p.m2, 0),
+                    qty_m3 = COALESCE(p.m3, 0),
+                    qty_m4 = COALESCE(p.m4, 0),
+                    qty_m5 = COALESCE(p.m5, 0),
+                    qty_m6 = COALESCE(p.m6, 0),
+                    qty_m7 = COALESCE(p.m7, 0),
+                    qty_m8 = COALESCE(p.m8, 0),
+                    qty_m9 = COALESCE(p.m9, 0),
+                    qty_m10 = COALESCE(p.m10, 0),
+                    qty_m11 = COALESCE(p.m11, 0),
+                    qty_m12 = COALESCE(p.m12, 0),
+                    -- 3-Month AMS (use M2, M3, M4 to avoid partial current month)
+                    ams_3m = ROUND((COALESCE(p.m2, 0) + COALESCE(p.m3, 0) + COALESCE(p.m4, 0)) / 3.0, 2)
+                FROM pivoted p
+                WHERE sms.stock_id = p.stock_id
+            """)
+
+            # Step 2: Calculate seasonality using all 12 months
+            await conn.execute("""
+                UPDATE wms.stock_movement_summary
+                SET
+                    seasonal_peak_trough_ratio = CASE
+                        WHEN LEAST(qty_m1, qty_m2, qty_m3, qty_m4, qty_m5, qty_m6,
+                                   qty_m7, qty_m8, qty_m9, qty_m10, qty_m11, qty_m12) > 0
+                        THEN ROUND(
+                            GREATEST(qty_m1, qty_m2, qty_m3, qty_m4, qty_m5, qty_m6,
+                                     qty_m7, qty_m8, qty_m9, qty_m10, qty_m11, qty_m12)::numeric /
+                            LEAST(qty_m1, qty_m2, qty_m3, qty_m4, qty_m5, qty_m6,
+                                  qty_m7, qty_m8, qty_m9, qty_m10, qty_m11, qty_m12)::numeric, 2)
+                        ELSE NULL
+                    END,
+                    seasonality_type = CASE
+                        WHEN ams_3m = 0 OR ams_3m IS NULL THEN 'DEAD'
+                        WHEN LEAST(qty_m1, qty_m2, qty_m3, qty_m4, qty_m5, qty_m6,
+                                   qty_m7, qty_m8, qty_m9, qty_m10, qty_m11, qty_m12) > 0
+                             AND GREATEST(qty_m1, qty_m2, qty_m3, qty_m4, qty_m5, qty_m6,
+                                          qty_m7, qty_m8, qty_m9, qty_m10, qty_m11, qty_m12) /
+                                 LEAST(qty_m1, qty_m2, qty_m3, qty_m4, qty_m5, qty_m6,
+                                       qty_m7, qty_m8, qty_m9, qty_m10, qty_m11, qty_m12) > 3.0 THEN 'HIGHLY_SEASONAL'
+                        WHEN LEAST(qty_m1, qty_m2, qty_m3, qty_m4, qty_m5, qty_m6,
+                                   qty_m7, qty_m8, qty_m9, qty_m10, qty_m11, qty_m12) > 0
+                             AND GREATEST(qty_m1, qty_m2, qty_m3, qty_m4, qty_m5, qty_m6,
+                                          qty_m7, qty_m8, qty_m9, qty_m10, qty_m11, qty_m12) /
+                                 LEAST(qty_m1, qty_m2, qty_m3, qty_m4, qty_m5, qty_m6,
+                                       qty_m7, qty_m8, qty_m9, qty_m10, qty_m11, qty_m12) >= 1.5 THEN 'MODERATELY_SEASONAL'
+                        ELSE 'STABLE'
+                    END
+            """)
+
+            # Step 3: Set velocity category based on AMS
+            await conn.execute("""
+                UPDATE wms.stock_movement_summary
+                SET velocity_category = CASE
+                    WHEN ams_3m >= 300 THEN 'FAST'       -- 10+ per day
+                    WHEN ams_3m >= 30 THEN 'MEDIUM'     -- 1-10 per day
+                    WHEN ams_3m > 0 THEN 'SLOW'         -- <1 per day
+                    ELSE 'DEAD'
+                END
+            """)
+
+            # Step 4: Set lead time category based on UD1
+            await conn.execute("""
+                UPDATE wms.stock_movement_summary
+                SET
+                    lead_time_category = CASE
+                        WHEN ud1_code = 'FLTHB' THEN 'LONG'
+                        ELSE 'STANDARD'
+                    END,
+                    lead_time_days = CASE
+                        WHEN ud1_code = 'FLTHB' THEN 90   -- House Brand: 3 months
+                        ELSE 14                           -- Standard: 2 weeks
+                    END
+            """)
+
+            # Step 5: Set target DOI based on ABC class and lead time
+            await conn.execute("""
+                UPDATE wms.stock_movement_summary
+                SET target_doi = CASE
+                    WHEN ud1_code = 'FLTHB' THEN 150      -- House Brand: 5 months (lead + buffer)
+                    WHEN abc_class = 'A' THEN 45          -- Class A: 45 days
+                    WHEN abc_class = 'B' THEN 60          -- Class B: 60 days
+                    ELSE 90                                -- Class C: 90 days
+                END
+            """)
+
+            # Step 6: Calculate reorder point
+            await conn.execute("""
+                UPDATE wms.stock_movement_summary
+                SET reorder_point = ROUND(
+                    (lead_time_days + 7) * (ams_3m / 30.0), 0  -- Lead time + 7 days safety * daily rate
+                )
+                WHERE ams_3m > 0
+            """)
+
+            # Step 7: Calculate trend 7d vs AMS (better than 7d vs 30d)
+            # AMS daily rate = ams_3m / 30, 7d daily rate = avg_daily_7d
+            # Trend % = ((7d rate - AMS rate) / AMS rate) × 100
+            await conn.execute("""
+                UPDATE wms.stock_movement_summary
+                SET
+                    trend_7d_vs_ams = CASE
+                        WHEN ams_3m > 0 THEN ROUND(
+                            ((avg_daily_7d - (ams_3m / 30.0)) / (ams_3m / 30.0)) * 100, 1
+                        )
+                        ELSE NULL
+                    END,
+                    trend_status = CASE
+                        WHEN ams_3m = 0 OR ams_3m IS NULL THEN 'NO_BASELINE'
+                        WHEN avg_daily_7d = 0 THEN 'NO_SALES'
+                        WHEN avg_daily_7d > (ams_3m / 30.0) * 1.5 THEN 'SPIKE'
+                        WHEN avg_daily_7d > (ams_3m / 30.0) * 1.3 THEN 'RISING'
+                        WHEN avg_daily_7d < (ams_3m / 30.0) * 0.5 THEN 'DROPPING'
+                        WHEN avg_daily_7d < (ams_3m / 30.0) * 0.7 THEN 'DECLINING'
+                        ELSE 'STABLE'
+                    END
+            """)
+
+            # Step 8: Calculate smart reorder recommendation
+            await conn.execute("""
+                UPDATE wms.stock_movement_summary
+                SET reorder_recommendation = CASE
+                    WHEN current_balance <= 0 THEN 'STOCKOUT'
+                    WHEN velocity_category = 'DEAD' AND abc_class = 'C' THEN 'DELIST_CANDIDATE'
+                    WHEN velocity_category = 'DEAD' THEN 'REVIEW'
+                    WHEN current_balance < COALESCE(reorder_point, 0) THEN 'ORDER_NOW'
+                    WHEN current_balance < COALESCE(reorder_point, 0) * 1.5 THEN 'ORDER_SOON'
+                    WHEN days_of_inventory > COALESCE(target_doi, 90) * 2 THEN 'STOP_ORDERING'
+                    WHEN days_of_inventory > COALESCE(target_doi, 90) THEN 'REDUCE_ORDER'
+                    ELSE 'HOLD'
+                END
+            """)
+
+            # Step 9: Get UOM descriptions
+            await conn.execute("""
+                UPDATE wms.stock_movement_summary sms
+                SET
+                    base_uom_desc = u_base."AcStockUOMDesc",
+                    order_uom_desc = COALESCE(u_order."AcStockUOMDesc", u_base."AcStockUOMDesc")
+                FROM "AcStockUOM" u_base
+                LEFT JOIN "AcStockUOM" u_order ON sms.order_uom = u_order."AcStockUOMID"
+                WHERE sms.base_uom = u_base."AcStockUOMID"
+            """)
+
+            # Get summary stats
+            summary = await conn.fetchrow("""
+                SELECT
+                    COUNT(*) FILTER (WHERE seasonality_type = 'HIGHLY_SEASONAL') as highly_seasonal,
+                    COUNT(*) FILTER (WHERE seasonality_type = 'MODERATELY_SEASONAL') as moderately_seasonal,
+                    COUNT(*) FILTER (WHERE seasonality_type = 'STABLE') as stable,
+                    COUNT(*) FILTER (WHERE seasonality_type = 'DEAD') as dead,
+                    COUNT(*) FILTER (WHERE velocity_category = 'FAST') as fast,
+                    COUNT(*) FILTER (WHERE velocity_category = 'MEDIUM') as medium,
+                    COUNT(*) FILTER (WHERE velocity_category = 'SLOW') as slow,
+                    COUNT(*) FILTER (WHERE reorder_recommendation = 'ORDER_NOW') as order_now,
+                    COUNT(*) FILTER (WHERE reorder_recommendation = 'ORDER_SOON') as order_soon,
+                    COUNT(*) FILTER (WHERE reorder_recommendation = 'STOP_ORDERING') as stop_ordering,
+                    COUNT(*) FILTER (WHERE reorder_recommendation = 'DELIST_CANDIDATE') as delist_candidates,
+                    COUNT(*) FILTER (WHERE trend_status = 'SPIKE') as trend_spike,
+                    COUNT(*) FILTER (WHERE trend_status = 'RISING') as trend_rising,
+                    COUNT(*) FILTER (WHERE trend_status = 'STABLE') as trend_stable,
+                    COUNT(*) FILTER (WHERE trend_status = 'DECLINING') as trend_declining,
+                    COUNT(*) FILTER (WHERE trend_status = 'DROPPING') as trend_dropping
+                FROM wms.stock_movement_summary
+            """)
+
+            elapsed = (datetime.now() - start_time).total_seconds()
+
+            return {
+                "status": "success",
+                "analysis_time_seconds": round(elapsed, 2),
+                "seasonality": {
+                    "highly_seasonal": summary['highly_seasonal'],
+                    "moderately_seasonal": summary['moderately_seasonal'],
+                    "stable": summary['stable'],
+                    "dead": summary['dead']
+                },
+                "velocity": {
+                    "fast": summary['fast'],
+                    "medium": summary['medium'],
+                    "slow": summary['slow']
+                },
+                "trend_vs_ams": {
+                    "spike": summary['trend_spike'],
+                    "rising": summary['trend_rising'],
+                    "stable": summary['trend_stable'],
+                    "declining": summary['trend_declining'],
+                    "dropping": summary['trend_dropping']
+                },
+                "recommendations": {
+                    "order_now": summary['order_now'],
+                    "order_soon": summary['order_soon'],
+                    "stop_ordering": summary['stop_ordering'],
+                    "delist_candidates": summary['delist_candidates']
+                }
             }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
