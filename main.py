@@ -3356,6 +3356,7 @@ async def analyze_monthly_movement(api_key: str = Query(...)):
             # Step 1: Calculate monthly sales for last 12 months
             # Use AcStockBalanceDetail (already indexed) instead of raw AcCSD/AcCusInvoiceD tables
             # M1 = current month, M12 = 12 months ago
+            # Set 5 minute timeout for this heavy query
             await conn.execute("""
                 WITH monthly_sales AS (
                     SELECT
@@ -3403,7 +3404,7 @@ async def analyze_monthly_movement(api_key: str = Query(...)):
                     ams_3m = ROUND((COALESCE(p.m2, 0) + COALESCE(p.m3, 0) + COALESCE(p.m4, 0)) / 3.0, 2)
                 FROM pivoted p
                 WHERE sms.stock_id = p.stock_id
-            """)
+            """, timeout=300)  # 5 minute timeout for heavy query
 
             # Step 2: Calculate seasonality using all 12 months
             await conn.execute("""
