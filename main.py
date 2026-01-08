@@ -3663,6 +3663,8 @@ async def setup_analytics(api_key: str = Query(...)):
                     -- 7-day rolling quantity (for real-time trend detection)
                     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='last_7d_qty') THEN
                         ALTER TABLE wms.stock_movement_summary ADD COLUMN last_7d_qty NUMERIC DEFAULT 0;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='last_sale_date') THEN
                         ALTER TABLE wms.stock_movement_summary ADD COLUMN last_sale_date DATE;
                     END IF;
                     -- Trend vs AMS
