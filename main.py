@@ -3354,33 +3354,18 @@ async def analyze_monthly_movement(api_key: str = Query(...)):
 
         async with pool.acquire() as conn:
             # Step 1: Calculate monthly sales for last 12 months
+            # Use AcStockBalanceDetail (already indexed) instead of raw AcCSD/AcCusInvoiceD tables
             # M1 = current month, M12 = 12 months ago
             await conn.execute("""
                 WITH monthly_sales AS (
                     SELECT
-                        d."AcStockID" as stock_id,
-                        DATE_TRUNC('month', m."DocumentDate") as sale_month,
-                        SUM(d."ItemQuantity") as qty
-                    FROM "AcCSD" d
-                    INNER JOIN "AcCSM" m ON d."DocumentNo" = m."DocumentNo"
-                    WHERE m."DocumentDate" >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '12 months'
-                    GROUP BY d."AcStockID", DATE_TRUNC('month', m."DocumentDate")
-
-                    UNION ALL
-
-                    SELECT
-                        d."AcStockID" as stock_id,
-                        DATE_TRUNC('month', m."DocumentDate") as sale_month,
-                        SUM(d."ItemQuantity") as qty
-                    FROM "AcCusInvoiceD" d
-                    INNER JOIN "AcCusInvoiceM" m ON d."AcCusInvoiceMID" = m."AcCusInvoiceMID"
-                    WHERE m."DocumentDate" >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '12 months'
-                    GROUP BY d."AcStockID", DATE_TRUNC('month', m."DocumentDate")
-                ),
-                monthly_totals AS (
-                    SELECT stock_id, sale_month, SUM(qty) as qty
-                    FROM monthly_sales
-                    GROUP BY stock_id, sale_month
+                        "AcStockID" as stock_id,
+                        DATE_TRUNC('month', "DocumentDate") as sale_month,
+                        SUM("QuantityOut") as qty
+                    FROM "AcStockBalanceDetail"
+                    WHERE "DocumentDate" >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '12 months'
+                      AND "DocumentType" IN ('CUS_CASH_SALES', 'CUS_INVOICE')
+                    GROUP BY "AcStockID", DATE_TRUNC('month', "DocumentDate")
                 ),
                 pivoted AS (
                     SELECT
@@ -3397,7 +3382,7 @@ async def analyze_monthly_movement(api_key: str = Query(...)):
                         MAX(CASE WHEN sale_month = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '9 months' THEN qty ELSE 0 END) as m10,
                         MAX(CASE WHEN sale_month = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '10 months' THEN qty ELSE 0 END) as m11,
                         MAX(CASE WHEN sale_month = DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '11 months' THEN qty ELSE 0 END) as m12
-                    FROM monthly_totals
+                    FROM monthly_sales
                     GROUP BY stock_id
                 )
                 UPDATE wms.stock_movement_summary sms
