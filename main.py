@@ -3669,6 +3669,11 @@ async def setup_analytics(api_key: str = Query(...)):
                         ALTER TABLE wms.stock_movement_summary ADD COLUMN target_doi INTEGER;
                         ALTER TABLE wms.stock_movement_summary ADD COLUMN reorder_point NUMERIC;
                     END IF;
+                    -- 7-day rolling quantity (for real-time trend detection)
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='last_7d_qty') THEN
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN last_7d_qty NUMERIC DEFAULT 0;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN last_sale_date DATE;
+                    END IF;
                     -- Trend vs AMS
                     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='trend_7d_vs_ams') THEN
                         ALTER TABLE wms.stock_movement_summary ADD COLUMN trend_7d_vs_ams NUMERIC;
