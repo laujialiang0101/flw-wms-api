@@ -3049,8 +3049,7 @@ async def refresh_stock_movement(api_key: str = Query(...)):
             # Create aggregated sales temp table (single pass through AcCSD)
             # IMPORTANT: Convert all quantities to BASE UOM by multiplying with StockUOMRate
             # This ensures sachets, boxes, twin-packs etc. are all normalized
-            # Set 10 minute timeout for this heavy query
-            await conn.execute("SET statement_timeout = '600000'")
+            # Use 10 minute timeout for this heavy query (asyncpg timeout param)
             await conn.execute("""
                 CREATE TABLE wms.temp_sales_agg AS
                 SELECT
@@ -3077,7 +3076,7 @@ async def refresh_stock_movement(api_key: str = Query(...)):
                 LEFT JOIN "AcStockCompany" sc ON d."AcStockID" = sc."AcStockID" AND d."AcStockUOMID" = sc."AcStockUOMID"
                 WHERE m."DocumentDate" >= CURRENT_DATE - 365
                 GROUP BY d."AcStockID"
-            """)
+            """, timeout=600)
             steps_completed.append("sales_agg")
 
             # Step 2: Create CV temp table
@@ -3096,11 +3095,8 @@ async def refresh_stock_movement(api_key: str = Query(...)):
                     GROUP BY d."AcStockID", DATE_TRUNC('month', m."DocumentDate")
                 ) ms
                 GROUP BY stock_id HAVING COUNT(*) >= 3
-            """)
+            """, timeout=600)
             steps_completed.append("cv_calc")
-
-            # Reset timeout to default for remaining queries
-            await conn.execute("SET statement_timeout = '60000'")
 
             # Step 3: Get max values for normalization
             max_vals = await conn.fetchrow("""
@@ -3114,8 +3110,6 @@ async def refresh_stock_movement(api_key: str = Query(...)):
             steps_completed.append("truncate")
 
             # Step 5: Insert all data with ABC calculation inline
-            # Set longer timeout for this heavy INSERT
-            await conn.execute("SET statement_timeout = '600000'")
             await conn.execute(f"""
                 INSERT INTO wms.stock_movement_summary (
                     stock_id, stock_name, barcode, category, brand, ud1_code,
@@ -3265,7 +3259,7 @@ async def refresh_stock_movement(api_key: str = Query(...)):
                 LEFT JOIN "AcStockCategory" cat ON sc."AcStockCategoryID" = cat."AcStockCategoryID"
                 LEFT JOIN "AcStockBrand" brand ON sc."AcStockBrandID" = brand."AcStockBrandID"
                 WHERE sc."AcStockUOMID" = sc."AcStockUOMIDBaseID" AND sc."StockIsActive" = 'Y'
-            """)
+            """, timeout=600)
             steps_completed.append("insert")
 
             # Get summary
