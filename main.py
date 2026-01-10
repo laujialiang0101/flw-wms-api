@@ -3006,6 +3006,10 @@ async def setup_stock_movement_table(api_key: str = Query(...)):
                     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='trend_7d_vs_ams') THEN
                         ALTER TABLE wms.stock_movement_summary ADD COLUMN trend_7d_vs_ams NUMERIC;
                     END IF;
+                    -- Product Family (from Colour ID - groups substitutable products)
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='product_family') THEN
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN product_family VARCHAR(100);
+                    END IF;
                 END $$;
             """)
 
@@ -3100,7 +3104,7 @@ async def refresh_stock_movement(api_key: str = Query(...)):
             await conn.execute(f"""
                 INSERT INTO wms.stock_movement_summary (
                     stock_id, stock_name, barcode, category, brand, ud1_code,
-                    therapeutic_group, active_ingredient, unit_cost,
+                    therapeutic_group, product_family, active_ingredient, unit_cost,
                     qty_last_7d, qty_last_14d, qty_last_30d, qty_last_90d, qty_last_365d,
                     avg_daily_7d, avg_daily_14d, avg_daily_30d, avg_daily_90d,
                     selling_days_30d, selling_days_90d,
@@ -3177,7 +3181,7 @@ async def refresh_stock_movement(api_key: str = Query(...)):
                 SELECT
                     sc."AcStockID", sc."StockDescription1", sc."StockBarcode",
                     cat."AcStockCategoryDesc", brand."AcStockBrandDesc", sc."AcStockUDGroup1ID",
-                    sc."AcStockColorID", sc."StockDescription2", sc."StockCost",
+                    sc."AcStockColorID", sc."AcStockColorID", sc."StockDescription2", sc."StockCost",
                     COALESCE(s.qty_7d, 0), COALESCE(s.qty_14d, 0), COALESCE(s.qty_30d, 0), COALESCE(s.qty_90d, 0), COALESCE(s.qty_365d, 0),
                     ROUND(COALESCE(s.qty_7d, 0) / 7.0, 2), ROUND(COALESCE(s.qty_14d, 0) / 14.0, 2),
                     ROUND(COALESCE(s.qty_30d, 0) / 30.0, 2), ROUND(COALESCE(s.qty_90d, 0) / 90.0, 2),
@@ -3320,7 +3324,7 @@ async def view_stock_movement(
                        base_uom, base_uom_desc, order_uom, order_uom_desc, order_uom_rate, balance_in_order_uom,
                        current_balance, days_of_inventory, stockout_risk,
                        suggested_reorder_qty, reorder_point, target_doi,
-                       revenue_last_30d, therapeutic_group,
+                       revenue_last_30d, therapeutic_group, product_family,
                        ams_3m, velocity_category, lead_time_category, lead_time_days,
                        seasonality_type, seasonal_peak_trough_ratio, peak_months,
                        reorder_recommendation,
@@ -3665,6 +3669,10 @@ async def setup_analytics(api_key: str = Query(...)):
                     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='base_uom_desc') THEN
                         ALTER TABLE wms.stock_movement_summary ADD COLUMN base_uom_desc VARCHAR(50);
                         ALTER TABLE wms.stock_movement_summary ADD COLUMN order_uom_desc VARCHAR(50);
+                    END IF;
+                    -- Product Family (from Colour ID)
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='product_family') THEN
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN product_family VARCHAR(100);
                     END IF;
                 END $$;
             """)
