@@ -3830,7 +3830,7 @@ async def get_sku_intelligence(
             query = f"""
                 SELECT
                     -- Product identification
-                    stock_id, stock_name, barcode, ud1_code,
+                    stock_id, stock_name, order_uom_stock_name, barcode, ud1_code,
 
                     -- NEW Classification System (Primary -> Secondary -> Tertiary)
                     demand_pattern,              -- PRIMARY: DEAD/NEW/DISC/SPORADIC/STRONG_DECLINE/DECLINE/STABLE/GROWTH/STRONG_GROWTH
