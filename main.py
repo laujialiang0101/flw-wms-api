@@ -3844,18 +3844,28 @@ async def get_sku_intelligence(
                     momentum_status,             -- Current momentum
                     momentum_index,              -- Momentum score
 
-                    -- Sales Velocity
-                    ams_calculated,              -- Average Monthly Sales (calculated)
-                    velocity_daily,              -- Daily velocity in base UOM
-                    ROUND(COALESCE(ams_calculated, 0) / NULLIF(COALESCE(order_uom_rate, 1), 0), 1) as ams_order_uom,
+                    -- Sales Velocity (ams_calculated is already in ORDER UOM from EOI script)
+                    ams_calculated,              -- Average Monthly Sales in ORDER UOM
+                    ams_base_uom,                -- Average Monthly Sales in BASE UOM
+                    velocity_daily,              -- Daily velocity in ORDER UOM
+                    ams_calculated as ams_order_uom,  -- Same as ams_calculated (already in order UOM)
 
                     -- Inventory
                     current_balance,
-                    balance_in_order_uom,
+                    ROUND(COALESCE(current_balance, 0) / NULLIF(COALESCE(order_uom_rate, 1), 0), 0) as balance_in_order_uom,
                     days_of_inventory,
                     reorder_point,
                     max_stock,
                     safety_multiplier,
+
+                    -- EOI Framework columns (NEW)
+                    safety_days,                 -- Safety buffer in days
+                    order_up_to_level,           -- EOI Order Up To level in ORDER UOM
+                    ams_status,                  -- Status description
+
+                    -- ABC Classification
+                    abc_class,
+                    gp_abc_class,
 
                     -- Action
                     reorder_recommendation,
