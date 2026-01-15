@@ -3930,6 +3930,345 @@ async def get_sku_intelligence(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/v1/analytics/outlets")
+async def get_outlets_for_user(
+    api_key: str = Query(...),
+    staff_id: str = Query(..., description="Staff ID for role-based filtering")
+):
+    """Get list of outlets accessible by the user based on their role.
+
+    Access Control:
+    - Staff/PIC: Only their primary_outlet
+    - Area Manager: All outlets in allowed_outlets array
+    - Admin/COO/CMO: All outlets
+    """
+    verify_api_key(api_key)
+
+    try:
+        async with pool.acquire() as conn:
+            # Get user's role and outlet assignments
+            staff = await conn.fetchrow("""
+                SELECT role, primary_outlet, primary_outlet_name, allowed_outlets, allowed_outlet_names, region
+                FROM kpi.staff_list_master
+                WHERE UPPER(staff_id) = UPPER($1) AND is_active = true
+            """, staff_id)
+
+            if not staff:
+                raise HTTPException(status_code=404, detail="Staff not found or inactive")
+
+            role = staff['role'].lower() if staff['role'] else 'staff'
+            outlets = []
+
+            if role in ('admin', 'coo', 'cmo', 'director'):
+                # Admin can see all outlets
+                rows = await conn.fetch("""
+                    SELECT DISTINCT location_id as id, location_name as name
+                    FROM wms.stock_movement_by_location
+                    WHERE location_id IS NOT NULL
+                    ORDER BY location_name
+                """)
+                outlets = [dict(row) for row in rows]
+            elif role == 'area_manager':
+                # Area manager sees outlets in their region
+                allowed = staff['allowed_outlets'] or []
+                names = staff['allowed_outlet_names'] or []
+                outlets = [{'id': id, 'name': name} for id, name in zip(allowed, names)]
+            else:
+                # Regular staff sees only their outlet
+                if staff['primary_outlet']:
+                    outlets = [{'id': staff['primary_outlet'], 'name': staff['primary_outlet_name']}]
+
+            return {
+                "status": "success",
+                "role": role,
+                "region": staff['region'],
+                "outlets": outlets
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/analytics/sku-intelligence-outlet")
+async def get_outlet_sku_intelligence(
+    api_key: str = Query(...),
+    outlet_id: str = Query(..., description="Outlet/Location ID"),
+    reorder_recommendation: Optional[str] = Query(default=None, description="Filter by action"),
+    ud1_code: Optional[str] = Query(default=None, description="Filter by UD1 category"),
+    search: Optional[str] = Query(default=None, description="Search by stock code or name"),
+    limit: int = Query(default=500, le=50000),
+    offset: int = Query(default=0)
+):
+    """Query outlet-level SKU intelligence from wms.stock_movement_by_location.
+
+    Returns M1-M12 sales data, AMS, current balance, DOI for a specific outlet.
+    Joins with wms.stock_movement_summary for classification data.
+    """
+    verify_api_key(api_key)
+
+    try:
+        async with pool.acquire() as conn:
+            # Get outlet name
+            outlet_row = await conn.fetchrow("""
+                SELECT DISTINCT location_name FROM wms.stock_movement_by_location
+                WHERE location_id = $1 LIMIT 1
+            """, outlet_id)
+
+            outlet_name = outlet_row['location_name'] if outlet_row else outlet_id
+
+            # Build WHERE clause
+            conditions = ["sml.location_id = $1"]
+            params = [outlet_id]
+            param_idx = 2
+
+            if reorder_recommendation:
+                conditions.append(f"sml.reorder_recommendation = ${param_idx}")
+                params.append(reorder_recommendation)
+                param_idx += 1
+
+            if ud1_code:
+                conditions.append(f"sml.ud1_code = ${param_idx}")
+                params.append(ud1_code)
+                param_idx += 1
+
+            if search:
+                conditions.append(f"(sml.stock_id ILIKE ${param_idx} OR sml.stock_name ILIKE ${param_idx})")
+                params.append(f"%{search}%")
+                param_idx += 1
+
+            where_clause = " AND ".join(conditions)
+
+            # Add pagination params
+            params.extend([limit, offset])
+
+            query = f"""
+                SELECT
+                    sml.stock_id,
+                    -- Use order_uom_stock_name from summary (product name in purchase UOM)
+                    COALESCE(sms.order_uom_stock_name, sms.stock_name, sml.stock_name) as stock_name,
+                    sms.order_uom_stock_name,  -- Explicit field for display
+                    sml.location_id,
+                    sml.location_name,
+                    sml.base_uom,
+                    COALESCE(sms.order_uom, sml.order_uom) as order_uom,
+                    COALESCE(sms.order_uom_rate, sml.order_uom_rate, 1) as order_uom_rate,
+                    COALESCE(sms.ud1_code, sml.ud1_code) as ud1_code,
+
+                    -- Monthly sales converted to ORDER UOM (base_qty / order_uom_rate)
+                    ROUND(COALESCE(sml.qty_m1, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 1) as qty_m1,
+                    ROUND(COALESCE(sml.qty_m2, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 1) as qty_m2,
+                    ROUND(COALESCE(sml.qty_m3, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 1) as qty_m3,
+                    ROUND(COALESCE(sml.qty_m4, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 1) as qty_m4,
+                    ROUND(COALESCE(sml.qty_m5, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 1) as qty_m5,
+                    ROUND(COALESCE(sml.qty_m6, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 1) as qty_m6,
+                    ROUND(COALESCE(sml.qty_m7, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 1) as qty_m7,
+                    ROUND(COALESCE(sml.qty_m8, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 1) as qty_m8,
+                    ROUND(COALESCE(sml.qty_m9, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 1) as qty_m9,
+                    ROUND(COALESCE(sml.qty_m10, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 1) as qty_m10,
+                    ROUND(COALESCE(sml.qty_m11, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 1) as qty_m11,
+                    ROUND(COALESCE(sml.qty_m12, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 1) as qty_m12,
+
+                    -- Aggregated metrics in ORDER UOM
+                    ROUND(COALESCE(sml.total_12m, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 1) as total_12m,
+                    ROUND(COALESCE(sml.ams_12m, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 2) as ams_12m,
+                    sml.pct_of_total,
+
+                    -- Live inventory
+                    COALESCE(sml.current_balance, 0) as current_balance,
+                    ROUND(COALESCE(sml.current_balance, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 0) as balance_in_order_uom,
+                    COALESCE(sml.days_of_inventory, 0) as days_of_inventory,
+                    COALESCE(sml.reorder_recommendation, 'REVIEW') as reorder_recommendation,
+
+                    -- Company-wide classification (from main summary)
+                    sms.demand_pattern,
+                    sms.variability_class,
+                    sms.trend_index,
+                    sms.abc_class,
+
+                    sml.last_updated
+                FROM wms.stock_movement_by_location sml
+                LEFT JOIN wms.stock_movement_summary sms ON sml.stock_id = sms.stock_id
+                WHERE {where_clause}
+                ORDER BY sml.ams_12m DESC NULLS LAST, sml.current_balance DESC NULLS LAST
+                LIMIT ${param_idx} OFFSET ${param_idx + 1}
+            """
+
+            rows = await conn.fetch(query, *params)
+
+            # Get total count
+            count_query = f"""
+                SELECT COUNT(*)
+                FROM wms.stock_movement_by_location sml
+                LEFT JOIN wms.stock_movement_summary sms ON sml.stock_id = sms.stock_id
+                WHERE {where_clause}
+            """
+            total = await conn.fetchval(count_query, *params[:-2])
+
+            # Get summary counts by reorder_recommendation
+            summary_query = """
+                SELECT reorder_recommendation, COUNT(*) as count
+                FROM wms.stock_movement_by_location
+                WHERE location_id = $1
+                GROUP BY reorder_recommendation
+            """
+            summary_rows = await conn.fetch(summary_query, outlet_id)
+            summary = {row['reorder_recommendation'] or 'REVIEW': row['count'] for row in summary_rows}
+
+            return {
+                "status": "success",
+                "outlet": {"id": outlet_id, "name": outlet_name},
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "summary": summary,
+                "data": [dict(row) for row in rows]
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/analytics/outlet-cross-recommendations")
+async def get_cross_outlet_recommendations(
+    api_key: str = Query(...),
+    outlet_id: str = Query(..., description="Target outlet ID"),
+    staff_id: str = Query(..., description="Staff ID to determine region"),
+    limit: int = Query(default=100, le=1000)
+):
+    """Get products selling in other regional outlets but NOT in this outlet.
+
+    Purpose: Help warehouse identify items to stock based on regional demand.
+    Only shows items where target outlet has ZERO sales (not just low sales).
+    """
+    verify_api_key(api_key)
+
+    try:
+        async with pool.acquire() as conn:
+            # Get user's region and allowed outlets
+            staff = await conn.fetchrow("""
+                SELECT role, region, allowed_outlets, allowed_outlet_names
+                FROM kpi.staff_list_master
+                WHERE UPPER(staff_id) = UPPER($1) AND is_active = true
+            """, staff_id)
+
+            if not staff:
+                raise HTTPException(status_code=404, detail="Staff not found")
+
+            role = staff['role'].lower() if staff['role'] else 'staff'
+            region = staff['region']
+            allowed_outlets = staff['allowed_outlets'] or []
+
+            # Determine regional outlets based on role
+            if role in ('admin', 'coo', 'cmo', 'director'):
+                # Admin: Get outlets in same region as target outlet
+                region_row = await conn.fetchrow("""
+                    SELECT region, allowed_outlets
+                    FROM kpi.staff_list_master
+                    WHERE primary_outlet = $1 AND role = 'area_manager' AND is_active = true
+                    LIMIT 1
+                """, outlet_id)
+                if region_row:
+                    regional_outlets = region_row['allowed_outlets'] or []
+                else:
+                    # Fallback: get all outlets
+                    outlets_rows = await conn.fetch("""
+                        SELECT DISTINCT location_id FROM wms.stock_movement_by_location
+                        WHERE location_id != $1
+                    """, outlet_id)
+                    regional_outlets = [r['location_id'] for r in outlets_rows]
+            elif role == 'area_manager':
+                regional_outlets = [o for o in allowed_outlets if o != outlet_id]
+            else:
+                # Regular staff - no cross-outlet recommendations
+                return {
+                    "status": "success",
+                    "outlet_id": outlet_id,
+                    "region": region,
+                    "message": "Cross-outlet recommendations not available for your role",
+                    "recommendations": []
+                }
+
+            if not regional_outlets:
+                return {
+                    "status": "success",
+                    "outlet_id": outlet_id,
+                    "region": region,
+                    "message": "No other outlets in region",
+                    "recommendations": []
+                }
+
+            # Query for products selling in region but NOT in target outlet
+            query = """
+                WITH regional_sales AS (
+                    -- Products with sales in regional outlets (excluding target)
+                    SELECT
+                        stock_id,
+                        location_id,
+                        location_name,
+                        ams_12m,
+                        total_12m
+                    FROM wms.stock_movement_by_location
+                    WHERE location_id = ANY($1::varchar[])
+                    AND ams_12m > 0
+                ),
+                target_outlet_sales AS (
+                    -- Products in target outlet
+                    SELECT stock_id, ams_12m, total_12m
+                    FROM wms.stock_movement_by_location
+                    WHERE location_id = $2
+                ),
+                recommendations AS (
+                    SELECT
+                        r.stock_id,
+                        ARRAY_AGG(DISTINCT r.location_id) as selling_outlet_ids,
+                        ARRAY_AGG(DISTINCT r.location_name) as selling_outlet_names,
+                        COUNT(DISTINCT r.location_id) as outlet_count,
+                        ROUND(AVG(r.ams_12m), 2) as regional_ams,
+                        ROUND(SUM(r.total_12m), 2) as regional_total,
+                        COALESCE(t.ams_12m, 0) as your_ams
+                    FROM regional_sales r
+                    LEFT JOIN target_outlet_sales t ON r.stock_id = t.stock_id
+                    WHERE t.ams_12m IS NULL OR t.ams_12m = 0  -- NOT selling in target
+                    GROUP BY r.stock_id, t.ams_12m
+                    HAVING COUNT(DISTINCT r.location_id) >= 2  -- At least 2 regional outlets
+                )
+                SELECT
+                    rec.stock_id,
+                    COALESCE(sms.stock_name, sml.stock_name) as stock_name,
+                    sms.ud1_code,
+                    sms.order_uom,
+                    sms.order_uom_rate,
+                    rec.selling_outlet_ids,
+                    rec.selling_outlet_names,
+                    rec.outlet_count,
+                    rec.regional_ams,
+                    rec.regional_total,
+                    rec.your_ams,
+                    ROUND(rec.regional_ams * 0.5, 0) as suggested_initial_qty,  -- Start with 50% of regional AMS
+                    sms.demand_pattern,
+                    sms.abc_class
+                FROM recommendations rec
+                LEFT JOIN wms.stock_movement_summary sms ON rec.stock_id = sms.stock_id
+                LEFT JOIN wms.stock_movement_by_location sml ON rec.stock_id = sml.stock_id AND sml.location_id = ANY($1::varchar[])
+                ORDER BY rec.outlet_count DESC, rec.regional_ams DESC
+                LIMIT $3
+            """
+
+            rows = await conn.fetch(query, regional_outlets, outlet_id, limit)
+
+            return {
+                "status": "success",
+                "outlet_id": outlet_id,
+                "region": region,
+                "regional_outlets": regional_outlets,
+                "total": len(rows),
+                "recommendations": [dict(row) for row in rows]
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     import uvicorn
