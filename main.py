@@ -4000,15 +4000,159 @@ async def get_outlet_sku_intelligence(
     limit: int = Query(default=500, le=50000),
     offset: int = Query(default=0)
 ):
-    """Query outlet-level SKU intelligence from wms.stock_movement_by_location.
+    """Query outlet-level SKU intelligence.
 
-    Returns M1-M12 sales data, AMS, current balance, DOI for a specific outlet.
-    Joins with wms.stock_movement_summary for classification data.
+    Uses wms.outlet_sku_data (fast pre-joined table) for instant queries.
+    Falls back to wms.stock_movement_by_location if fast table unavailable.
     """
     verify_api_key(api_key)
 
     try:
         async with pool.acquire() as conn:
+            # Check if fast table exists (refreshed by sync service)
+            fast_table_exists = await conn.fetchval("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'wms' AND table_name = 'outlet_sku_data'
+                )
+            """)
+
+            if fast_table_exists:
+                # ============================================================
+                # FAST PATH: Query from pre-joined, non-bloated table
+                # This table is DROP + CREATE each sync cycle (zero dead tuples)
+                # ============================================================
+                # Build WHERE clause
+                conditions = ["d.location_id = $1"]
+                params = [outlet_id]
+                param_idx = 2
+
+                if reorder_recommendation:
+                    conditions.append(f"d.reorder_recommendation = ${param_idx}")
+                    params.append(reorder_recommendation)
+                    param_idx += 1
+
+                if ud1_code:
+                    conditions.append(f"d.ud1_code = ${param_idx}")
+                    params.append(ud1_code)
+                    param_idx += 1
+
+                if search:
+                    conditions.append(f"(d.stock_id ILIKE ${param_idx} OR d.stock_name ILIKE ${param_idx})")
+                    params.append(f"%{search}%")
+                    param_idx += 1
+
+                where_clause = " AND ".join(conditions)
+                params.extend([limit, offset])
+
+                # Get outlet name from fast table
+                outlet_row = await conn.fetchrow(f"""
+                    SELECT DISTINCT location_name FROM wms.outlet_sku_data
+                    WHERE location_id = $1 LIMIT 1
+                """, outlet_id)
+                outlet_name = outlet_row['location_name'] if outlet_row else outlet_id
+
+                # Fast query - all data pre-joined, indexed, no bloat
+                query = f"""
+                    SELECT
+                        d.stock_id,
+                        d.stock_name,
+                        d.stock_name as order_uom_stock_name,
+                        d.location_id,
+                        d.location_name,
+                        d.base_uom,
+                        d.order_uom,
+                        d.order_uom_rate,
+                        d.ud1_code,
+                        ROUND(COALESCE(d.qty_m1, 0) / NULLIF(d.order_uom_rate, 0), 1) as qty_m1,
+                        ROUND(COALESCE(d.qty_m2, 0) / NULLIF(d.order_uom_rate, 0), 1) as qty_m2,
+                        ROUND(COALESCE(d.qty_m3, 0) / NULLIF(d.order_uom_rate, 0), 1) as qty_m3,
+                        ROUND(COALESCE(d.qty_m4, 0) / NULLIF(d.order_uom_rate, 0), 1) as qty_m4,
+                        ROUND(COALESCE(d.qty_m5, 0) / NULLIF(d.order_uom_rate, 0), 1) as qty_m5,
+                        ROUND(COALESCE(d.qty_m6, 0) / NULLIF(d.order_uom_rate, 0), 1) as qty_m6,
+                        ROUND(COALESCE(d.qty_m7, 0) / NULLIF(d.order_uom_rate, 0), 1) as qty_m7,
+                        ROUND(COALESCE(d.qty_m8, 0) / NULLIF(d.order_uom_rate, 0), 1) as qty_m8,
+                        ROUND(COALESCE(d.qty_m9, 0) / NULLIF(d.order_uom_rate, 0), 1) as qty_m9,
+                        ROUND(COALESCE(d.qty_m10, 0) / NULLIF(d.order_uom_rate, 0), 1) as qty_m10,
+                        ROUND(COALESCE(d.qty_m11, 0) / NULLIF(d.order_uom_rate, 0), 1) as qty_m11,
+                        ROUND(COALESCE(d.qty_m12, 0) / NULLIF(d.order_uom_rate, 0), 1) as qty_m12,
+                        ROUND(COALESCE(d.total_12m, 0) / NULLIF(d.order_uom_rate, 0), 1) as total_12m,
+                        ROUND(COALESCE(d.ams_12m, 0) / NULLIF(d.order_uom_rate, 0), 2) as ams_12m,
+                        d.pct_of_total,
+                        ROUND(COALESCE(d.ams_calculated, 0) / NULLIF(d.order_uom_rate, 0), 2) as ams_calculated,
+                        COALESCE(d.velocity_daily, 0) as velocity_daily,
+                        COALESCE(d.safety_days, 0) as safety_days,
+                        ROUND(COALESCE(d.reorder_point, 0) / NULLIF(d.order_uom_rate, 0), 1) as reorder_point,
+                        ROUND(COALESCE(d.max_stock, 0) / NULLIF(d.order_uom_rate, 0), 1) as max_stock,
+                        d.outlet_cv,
+                        d.outlet_variability_class,
+                        COALESCE(d.outlet_safety_days, 0) as outlet_safety_days,
+                        ROUND(COALESCE(d.order_up_to_level, 0) / NULLIF(d.order_uom_rate, 0), 1) as order_up_to_level,
+                        GREATEST(0, ROUND(
+                            (COALESCE(d.order_up_to_level, 0) - COALESCE(d.current_balance, 0))
+                            / NULLIF(d.order_uom_rate, 0), 1
+                        )) as reorder_qty,
+                        COALESCE(d.current_balance, 0) as current_balance,
+                        ROUND(COALESCE(d.current_balance, 0) / NULLIF(d.order_uom_rate, 0), 0) as balance_in_order_uom,
+                        COALESCE(d.days_of_inventory, 0) as days_of_inventory,
+                        COALESCE(d.reorder_recommendation, 'REVIEW') as reorder_recommendation,
+                        d.demand_pattern,
+                        d.variability_class,
+                        d.outlet_variability_class as outlet_var_class,
+                        d.trend_index,
+                        d.abc_class,
+                        d.last_updated
+                    FROM wms.outlet_sku_data d
+                    WHERE {where_clause}
+                    ORDER BY d.ams_calculated DESC NULLS LAST, d.current_balance DESC NULLS LAST
+                    LIMIT ${param_idx} OFFSET ${param_idx + 1}
+                """
+
+                rows = await conn.fetch(query, *params)
+
+                # Get summary from fast summary table
+                summary_row = await conn.fetchrow("""
+                    SELECT total_skus, stockout_count, order_now_count, order_soon_count,
+                           optimal_count, overstocked_count, review_count
+                    FROM wms.outlet_sku_summary
+                    WHERE location_id = $1
+                """, outlet_id)
+
+                if summary_row:
+                    summary = {
+                        'STOCKOUT': summary_row['stockout_count'],
+                        'ORDER_NOW': summary_row['order_now_count'],
+                        'ORDER_SOON': summary_row['order_soon_count'],
+                        'OPTIMAL': summary_row['optimal_count'],
+                        'OVERSTOCKED': summary_row['overstocked_count'],
+                        'REVIEW': summary_row['review_count']
+                    }
+                    if not reorder_recommendation and not ud1_code and not search:
+                        total = summary_row['total_skus']
+                    else:
+                        total = await conn.fetchval(f"""
+                            SELECT COUNT(*) FROM wms.outlet_sku_data d WHERE {where_clause}
+                        """, *params[:-2])
+                else:
+                    summary = {}
+                    total = await conn.fetchval(f"""
+                        SELECT COUNT(*) FROM wms.outlet_sku_data d WHERE {where_clause}
+                    """, *params[:-2])
+
+                return {
+                    "status": "success",
+                    "outlet": {"id": outlet_id, "name": outlet_name},
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                    "summary": summary,
+                    "data": [dict(row) for row in rows]
+                }
+
+            # ============================================================
+            # SLOW PATH: Fallback to original bloated table
+            # Only used if fast table hasn't been created yet
+            # ============================================================
             # Get outlet name
             outlet_row = await conn.fetchrow("""
                 SELECT DISTINCT location_name FROM wms.stock_movement_by_location
