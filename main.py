@@ -4021,7 +4021,11 @@ async def get_outlet_sku_intelligence(
                 # ============================================================
                 # FAST PATH: Query from pre-joined, non-bloated table
                 # This table is DROP + CREATE each sync cycle (zero dead tuples)
+                # OPTIMIZED: Uses pre-computed row_num for instant pagination
                 # ============================================================
+                # Determine if we can use instant pagination (no filters)
+                has_filters = bool(reorder_recommendation or ud1_code or search)
+
                 # Build WHERE clause
                 conditions = ["d.location_id = $1"]
                 params = [outlet_id]
@@ -4042,8 +4046,18 @@ async def get_outlet_sku_intelligence(
                     params.append(f"%{search}%")
                     param_idx += 1
 
+                # Build where clause for count (without pagination)
+                count_where_clause = " AND ".join(conditions)
+                count_params = params.copy()
+
+                # For unfiltered queries, use row_num for instant pagination
+                if not has_filters:
+                    conditions.append(f"d.row_num > ${param_idx}")
+                    params.append(offset)
+                    param_idx += 1
+
                 where_clause = " AND ".join(conditions)
-                params.extend([limit, offset])
+                params.append(limit)  # Only need limit now
 
                 # Get outlet name from fast table
                 outlet_row = await conn.fetchrow(f"""
@@ -4053,6 +4067,16 @@ async def get_outlet_sku_intelligence(
                 outlet_name = outlet_row['location_name'] if outlet_row else outlet_id
 
                 # Fast query - all data pre-joined, indexed, no bloat
+                # For unfiltered: uses row_num index for instant pagination
+                # For filtered: falls back to ORDER BY
+                if has_filters:
+                    order_clause = "ORDER BY d.ams_calculated DESC NULLS LAST, d.current_balance DESC NULLS LAST"
+                    limit_clause = f"LIMIT ${param_idx} OFFSET ${param_idx + 1}"
+                    params.append(offset)  # Need offset for filtered queries
+                else:
+                    order_clause = "ORDER BY d.row_num"  # Already filtered by row_num > offset
+                    limit_clause = f"LIMIT ${param_idx}"
+
                 query = f"""
                     SELECT
                         d.stock_id,
@@ -4104,8 +4128,8 @@ async def get_outlet_sku_intelligence(
                         d.last_updated
                     FROM wms.outlet_sku_data d
                     WHERE {where_clause}
-                    ORDER BY d.ams_calculated DESC NULLS LAST, d.current_balance DESC NULLS LAST
-                    LIMIT ${param_idx} OFFSET ${param_idx + 1}
+                    {order_clause}
+                    {limit_clause}
                 """
 
                 rows = await conn.fetch(query, *params)
@@ -4127,17 +4151,19 @@ async def get_outlet_sku_intelligence(
                         'OVERSTOCKED': summary_row['overstocked_count'],
                         'REVIEW': summary_row['review_count']
                     }
-                    if not reorder_recommendation and not ud1_code and not search:
+                    if not has_filters:
+                        # Use pre-computed total from summary table
                         total = summary_row['total_skus']
                     else:
+                        # Count with filters (excludes row_num condition)
                         total = await conn.fetchval(f"""
-                            SELECT COUNT(*) FROM wms.outlet_sku_data d WHERE {where_clause}
-                        """, *params[:-2])
+                            SELECT COUNT(*) FROM wms.outlet_sku_data d WHERE {count_where_clause}
+                        """, *count_params)
                 else:
                     summary = {}
                     total = await conn.fetchval(f"""
-                        SELECT COUNT(*) FROM wms.outlet_sku_data d WHERE {where_clause}
-                    """, *params[:-2])
+                        SELECT COUNT(*) FROM wms.outlet_sku_data d WHERE {count_where_clause}
+                    """, *count_params)
 
                 return {
                     "status": "success",
