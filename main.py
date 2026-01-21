@@ -3826,11 +3826,11 @@ async def get_sku_intelligence(
                 param_idx += 1
 
             if is_active:
-                # Filter by StockIsActive from AcStockCompany
+                # Filter by denormalized is_active column (no JOIN needed)
                 if is_active == 'Y':
-                    conditions.append(f"sc.\"StockIsActive\" = 'Y'")
+                    conditions.append(f"sms.is_active = true")
                 else:
-                    conditions.append(f"(sc.\"StockIsActive\" = 'N' OR sc.\"StockIsActive\" IS NULL)")
+                    conditions.append(f"sms.is_active = false")
 
             if review_flag:
                 if review_flag == 'NEEDS_REVIEW':
@@ -3855,7 +3855,7 @@ async def get_sku_intelligence(
                 SELECT
                     -- Product identification
                     sms.stock_id, sms.stock_name, sms.order_uom_stock_name, sms.barcode, sms.ud1_code,
-                    COALESCE(sc."StockIsActive" = 'Y', true) as is_active,  -- From AcStockCompany
+                    sms.is_active,  -- Denormalized from AcStockCompany (no JOIN needed)
 
                     -- Monthly Sales (M1-M4) - stored in BASE UOM, convert to ORDER UOM
                     ROUND(COALESCE(sms.qty_m1, 0) / NULLIF(sms.order_uom_rate, 0), 1) as qty_m1,
@@ -3918,8 +3918,6 @@ async def get_sku_intelligence(
                     sms.reviewed_by,
                     sms.active_months
                 FROM wms.stock_movement_summary sms
-                LEFT JOIN "AcStockCompany" sc ON sc."AcStockID" = sms.stock_id
-                    AND sc."AcStockUOMID" = COALESCE(sms.order_uom, '')
                 WHERE {where_clause}
                 ORDER BY
                     CASE sms.demand_pattern
@@ -3940,12 +3938,10 @@ async def get_sku_intelligence(
 
             rows = await conn.fetch(query, *params)
 
-            # Get total count (with current filters)
+            # Get total count (with current filters) - no JOIN needed
             count_query = f"""
                 SELECT COUNT(*)
                 FROM wms.stock_movement_summary sms
-                LEFT JOIN "AcStockCompany" sc ON sc."AcStockID" = sms.stock_id
-                    AND sc."AcStockUOMID" = COALESCE(sms.order_uom, '')
                 WHERE {where_clause}
             """
             total = await conn.fetchval(count_query, *params[:-2]) if params[:-2] else await conn.fetchval("SELECT COUNT(*) FROM wms.stock_movement_summary")
@@ -3959,22 +3955,16 @@ async def get_sku_intelligence(
             summary_query = f"""
                 SELECT sms.reorder_recommendation, COUNT(*) as count
                 FROM wms.stock_movement_summary sms
-                LEFT JOIN "AcStockCompany" sc ON sc."AcStockID" = sms.stock_id
-                    AND sc."AcStockUOMID" = COALESCE(sms.order_uom, '')
                 WHERE {summary_where}
                 GROUP BY sms.reorder_recommendation
             """
             summary_rows = await conn.fetch(summary_query, *summary_params) if summary_params else await conn.fetch(summary_query)
             summary = {row['reorder_recommendation'] or 'UNKNOWN': row['count'] for row in summary_rows}
 
-            # Get review summary counts (items needing attention)
+            # Get review summary counts (items needing attention) - no JOIN needed
             review_query = f"""
-                SELECT
-                    review_flag,
-                    COUNT(*) as count
+                SELECT review_flag, COUNT(*) as count
                 FROM wms.stock_movement_summary sms
-                LEFT JOIN "AcStockCompany" sc ON sc."AcStockID" = sms.stock_id
-                    AND sc."AcStockUOMID" = COALESCE(sms.order_uom, '')
                 WHERE {summary_where}
                   AND sms.review_flag IS NOT NULL
                 GROUP BY sms.review_flag
@@ -3986,8 +3976,6 @@ async def get_sku_intelligence(
             needs_review_query = f"""
                 SELECT COUNT(*) as count
                 FROM wms.stock_movement_summary sms
-                LEFT JOIN "AcStockCompany" sc ON sc."AcStockID" = sms.stock_id
-                    AND sc."AcStockUOMID" = COALESCE(sms.order_uom, '')
                 WHERE {summary_where}
                   AND sms.review_flag IN ('NEW_ITEM', 'AMS_CHECK')
                   AND sms.reviewed_at IS NULL
