@@ -4023,7 +4023,16 @@ async def get_outlet_sku_intelligence(
                 # This table is DROP + CREATE each sync cycle (zero dead tuples)
                 # OPTIMIZED: Uses pre-computed row_num for instant pagination
                 # ============================================================
-                # Determine if we can use instant pagination (no filters)
+                # Check if optimized row_num column exists
+                has_row_num = await conn.fetchval("""
+                    SELECT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = 'wms' AND table_name = 'outlet_sku_data'
+                        AND column_name = 'row_num'
+                    )
+                """)
+
+                # Determine if we can use instant pagination (no filters + row_num exists)
                 has_filters = bool(reorder_recommendation or ud1_code or search)
 
                 # Build WHERE clause
@@ -4050,14 +4059,17 @@ async def get_outlet_sku_intelligence(
                 count_where_clause = " AND ".join(conditions)
                 count_params = params.copy()
 
-                # For unfiltered queries, use row_num for instant pagination
-                if not has_filters:
+                # Determine if we can use instant row_num pagination
+                use_row_num_pagination = has_row_num and not has_filters
+
+                # For unfiltered queries with row_num, use instant pagination
+                if use_row_num_pagination:
                     conditions.append(f"d.row_num > ${param_idx}")
                     params.append(offset)
                     param_idx += 1
 
                 where_clause = " AND ".join(conditions)
-                params.append(limit)  # Only need limit now
+                params.append(limit)
 
                 # Get outlet name from fast table
                 outlet_row = await conn.fetchrow(f"""
@@ -4067,15 +4079,15 @@ async def get_outlet_sku_intelligence(
                 outlet_name = outlet_row['location_name'] if outlet_row else outlet_id
 
                 # Fast query - all data pre-joined, indexed, no bloat
-                # For unfiltered: uses row_num index for instant pagination
-                # For filtered: falls back to ORDER BY
-                if has_filters:
-                    order_clause = "ORDER BY d.ams_calculated DESC NULLS LAST, d.current_balance DESC NULLS LAST"
-                    limit_clause = f"LIMIT ${param_idx} OFFSET ${param_idx + 1}"
-                    params.append(offset)  # Need offset for filtered queries
-                else:
+                # For unfiltered with row_num: uses row_num index for instant pagination
+                # Otherwise: falls back to ORDER BY + OFFSET
+                if use_row_num_pagination:
                     order_clause = "ORDER BY d.row_num"  # Already filtered by row_num > offset
                     limit_clause = f"LIMIT ${param_idx}"
+                else:
+                    order_clause = "ORDER BY d.ams_calculated DESC NULLS LAST, d.current_balance DESC NULLS LAST"
+                    limit_clause = f"LIMIT ${param_idx} OFFSET ${param_idx + 1}"
+                    params.append(offset)  # Need offset for non-row_num queries
 
                 query = f"""
                     SELECT
