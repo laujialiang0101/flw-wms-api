@@ -4444,6 +4444,28 @@ async def get_outlet_sku_intelligence(
                         SELECT COUNT(*) FROM wms.outlet_sku_data d WHERE {count_where_clause}
                     """, *count_params)
 
+                # Get review_summary from master SKU data for items in this outlet
+                review_summary_rows = await conn.fetch("""
+                    SELECT
+                        COALESCE(sms.review_flag, 'NONE') as review_flag,
+                        COUNT(*) as cnt
+                    FROM wms.outlet_sku_data d
+                    LEFT JOIN wms.stock_movement_summary sms ON d.stock_id = sms.stock_id
+                    WHERE d.location_id = $1
+                    GROUP BY COALESCE(sms.review_flag, 'NONE')
+                """, outlet_id)
+
+                review_summary = {}
+                needs_review_count = 0
+                for row in review_summary_rows:
+                    flag = row['review_flag']
+                    cnt = row['cnt']
+                    review_summary[flag] = cnt
+                    # Count items that need review (NEW_ITEM or AMS_CHECK)
+                    if flag in ('NEW_ITEM', 'AMS_CHECK'):
+                        needs_review_count += cnt
+                review_summary['NEEDS_REVIEW'] = needs_review_count
+
                 return {
                     "status": "success",
                     "outlet": {"id": outlet_id, "name": outlet_name},
@@ -4451,6 +4473,7 @@ async def get_outlet_sku_intelligence(
                     "limit": limit,
                     "offset": offset,
                     "summary": summary,
+                    "review_summary": review_summary,
                     "data": [dict(row) for row in rows]
                 }
 
@@ -4613,6 +4636,27 @@ async def get_outlet_sku_intelligence(
                 summary_rows = await conn.fetch(summary_query, outlet_id)
                 summary = {row['reorder_recommendation'] or 'REVIEW': row['count'] for row in summary_rows}
 
+            # Get review_summary from master SKU data for items in this outlet (slow path)
+            review_summary_rows = await conn.fetch("""
+                SELECT
+                    COALESCE(sms.review_flag, 'NONE') as review_flag,
+                    COUNT(*) as cnt
+                FROM wms.stock_movement_by_location sml
+                LEFT JOIN wms.stock_movement_summary sms ON sml.stock_id = sms.stock_id
+                WHERE sml.location_id = $1
+                GROUP BY COALESCE(sms.review_flag, 'NONE')
+            """, outlet_id)
+
+            review_summary = {}
+            needs_review_count = 0
+            for row in review_summary_rows:
+                flag = row['review_flag']
+                cnt = row['cnt']
+                review_summary[flag] = cnt
+                if flag in ('NEW_ITEM', 'AMS_CHECK'):
+                    needs_review_count += cnt
+            review_summary['NEEDS_REVIEW'] = needs_review_count
+
             return {
                 "status": "success",
                 "outlet": {"id": outlet_id, "name": outlet_name},
@@ -4620,6 +4664,7 @@ async def get_outlet_sku_intelligence(
                 "limit": limit,
                 "offset": offset,
                 "summary": summary,
+                "review_summary": review_summary,
                 "data": [dict(row) for row in rows]
             }
     except Exception as e:
